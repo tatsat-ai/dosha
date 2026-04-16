@@ -3,21 +3,22 @@
 analyze_dosha.py — Dosha Assessment Data Analysis & Visualization
 
 Reads from dosha_assessment.db and generates:
-  1. Spherical triangle plot — G vectors for all models
-  2. Probe heatmap — per-model, per-probe score breakdown
-  3. Head-to-head comparison — side-by-side probe scores
-  4. Radar chart — category breakdown (Vata/Pitta/Kapha probes) per model
-  5. Summary table — HTML report
+  1.  summary        — G vector + dosha profile table
+  2.  dosha_triangle — Constitutional triangle, composite score
+  3.  dosha_strip    — Per-probe dot cloud (spread = constitution)
+  4.  icc_chart      — Judge ICC(2,1) reliability per dosha dimension
+  5.  sphere         — Guna triangle T/R/S
+  6.  vata_3d        — Vata scores per probe & model (3D)
+  7.  pitta_3d       — Pitta scores per probe & model (3D)
+  8.  kapha_3d       — Kapha scores per probe & model (3D)
+  9.  heatmap_S      — Sattva heatmap (probe × model)
+  10. heatmap_T      — Tamas heatmap (probe × model)
+  11. heatmap_R      — Rajas heatmap (probe × model)
+  12. divergence     — Top 15 most discriminating probes
+  13. report.html    — All charts combined in one page
 
 Usage:
     python analyze_dosha.py [--db <path>] [--out <dir>]
-
-Outputs (all in --out directory, default ./dosha_results/):
-    sphere.html
-    heatmap.html
-    head_to_head.html
-    radar.html
-    report.html
 """
 
 import os
@@ -80,8 +81,11 @@ def get_dosha_vectors(con) -> list:
     # Check if composite columns exist (migration may not have run yet)
     cols = [r[1] for r in con.execute("PRAGMA table_info(DoshaVectors)").fetchall()]
     has_composite = 'vata_comp_norm' in cols
+    has_icc = 'icc_V' in cols
+    icc_extra = ", dv.icc_V, dv.icc_P, dv.icc_K" if has_icc else ", NULL as icc_V, NULL as icc_P, NULL as icc_K"
     extra = ", dv.vata_sd, dv.pitta_sd, dv.kapha_sd, dv.vata_comp_norm, dv.pitta_comp_norm, dv.kapha_comp_norm" \
             if has_composite else ", NULL as vata_sd, NULL as pitta_sd, NULL as kapha_sd, NULL as vata_comp_norm, NULL as pitta_comp_norm, NULL as kapha_comp_norm"
+    extra += icc_extra
     return con.execute(
         f"SELECT dv.*, m.display_name, m.provider {extra} "
         "FROM DoshaVectors dv JOIN Models m ON m.model_id = dv.model_id "
@@ -346,42 +350,6 @@ def make_heatmap(probe_scores: list, dimension: str = 'S') -> go.Figure:
     )
     return fig
 
-# ── Head-to-Head Comparison ────────────────────────────────────────────────────
-
-def make_head_to_head(probe_scores: list) -> go.Figure:
-    """
-    Bar chart showing S score per probe for all models side by side.
-    Sorted by probe_id. Models as grouped bars.
-    """
-    models = sorted(set(r['display_name'] for r in probe_scores))
-    probes = sorted(set(r['probe_id'] for r in probe_scores),
-                    key=lambda p: [int(x) if x.isdigit() else x.lower() for x in __import__('re').split(r'(\d+)', p)])
-
-    data = {m: {} for m in models}
-    for row in probe_scores:
-        data[row['display_name']][row['probe_id']] = float(row['S'] or 0)
-
-    fig = go.Figure()
-    for i, model in enumerate(models):
-        color = MODEL_COLORS[i % len(MODEL_COLORS)]
-        s_vals = [data[model].get(p, 0) for p in probes]
-        fig.add_trace(go.Bar(
-            name=model, x=probes, y=s_vals,
-            marker_color=color,
-            hovertemplate=f'<b>{model}</b><br>%{{x}}: %{{y:.2f}}<extra></extra>'
-        ))
-
-    fig.update_layout(
-        **PLOTLY_TEMPLATE['layout'],
-        title='Sattva Score (g_S) — Head-to-Head by Probe',
-        barmode='group',
-        xaxis=dict(tickangle=45, tickfont=dict(size=9), title='Probe'),
-        yaxis=dict(range=[0, 4.3], title='g_S Score (0–4)'),
-        height=950,
-        margin=dict(t=60, b=100, l=60, r=40),
-    )
-    return fig
-
 # ── Radar Chart ────────────────────────────────────────────────────────────────
 
 def make_3d_bar_chart(probe_scores: list, category: str,
@@ -530,37 +498,6 @@ def get_dosha_probe_scores(con) -> list:
         ORDER BY r.model_id, r.probe_id
     """).fetchall()
 
-def get_dosha_variance(con) -> list:
-    """Per-model variance metrics across probe scores."""
-    rows = con.execute("""
-        SELECT name FROM sqlite_master
-        WHERE type='table' AND name='DoshaVectors'
-    """).fetchone()
-    if not rows:
-        return []
-    # SQLite lacks STDEV — compute via variance formula: AVG(x*x) - AVG(x)*AVG(x)
-    return con.execute("""
-        SELECT r.model_id, m.display_name, p.category,
-               AVG(CASE WHEN p.category='vata'  THEN s.d_V END) as mean_V,
-               AVG(CASE WHEN p.category='pitta' THEN s.d_P END) as mean_P,
-               AVG(CASE WHEN p.category='kapha' THEN s.d_K END) as mean_K,
-               AVG(CASE WHEN p.category='vata'  THEN s.d_V*s.d_V END)
-                 - AVG(CASE WHEN p.category='vata'  THEN s.d_V END)
-                 * AVG(CASE WHEN p.category='vata'  THEN s.d_V END) as var_V,
-               AVG(CASE WHEN p.category='pitta' THEN s.d_P*s.d_P END)
-                 - AVG(CASE WHEN p.category='pitta' THEN s.d_P END)
-                 * AVG(CASE WHEN p.category='pitta' THEN s.d_P END) as var_P,
-               AVG(CASE WHEN p.category='kapha' THEN s.d_K*s.d_K END)
-                 - AVG(CASE WHEN p.category='kapha' THEN s.d_K END)
-                 * AVG(CASE WHEN p.category='kapha' THEN s.d_K END) as var_K
-        FROM Responses r
-        JOIN Models m ON m.model_id = r.model_id
-        JOIN Probes p ON p.probe_id = r.probe_id
-        JOIN Scores s ON s.response_id = r.response_id
-        WHERE s.d_V IS NOT NULL OR s.d_P IS NOT NULL OR s.d_K IS NOT NULL
-        GROUP BY r.model_id
-        ORDER BY r.model_id
-    """).fetchall()
 
 def _ternary_xy(v, p, k):
     """Convert Vata/Pitta/Kapha fractions to ternary Cartesian (x, y).
@@ -634,60 +571,56 @@ def make_dosha_strip(dosha_probe_scores: list) -> go.Figure:
     )
     return fig
 
-def make_cv_chart(dosha_variance: list) -> go.Figure:
+def make_icc_chart(dosha_vectors: list) -> go.Figure:
     """
-    Coefficient of variation bar chart — σ/μ per model per dosha.
-    High CV = variable/scattered (Vata signature).
-    Low CV = consistent character (Kapha or Pitta settled).
+    ICC(2,1) reliability chart — one grouped bar per model, three bars per model
+    for icc_V, icc_P, icc_K.  Reference lines at 0.75 (good) and 0.50 (moderate).
+    Measures how consistently the judge discriminates between probes across
+    repeated runs on each constitutional axis.
     """
-    if not dosha_variance:
+    if not dosha_vectors:
         return None
 
-    models = [r['display_name'] for r in dosha_variance]
+    models  = [dv['display_name'] for dv in dosha_vectors]
+    icc_v   = [dv['icc_V'] if dv['icc_V'] is not None else 0.0 for dv in dosha_vectors]
+    icc_p   = [dv['icc_P'] if dv['icc_P'] is not None else 0.0 for dv in dosha_vectors]
+    icc_k   = [dv['icc_K'] if dv['icc_K'] is not None else 0.0 for dv in dosha_vectors]
 
-    def safe_cv(var, mean):
-        if mean and mean > 0 and var and var > 0:
-            return math.sqrt(var) / mean
-        return 0.0
-
-    cv_v = [safe_cv(r['var_V'], r['mean_V']) for r in dosha_variance]
-    cv_p = [safe_cv(r['var_P'], r['mean_P']) for r in dosha_variance]
-    cv_k = [safe_cv(r['var_K'], r['mean_K']) for r in dosha_variance]
-    # Constitutional stability = 1 / (1 + mean CV across all dimensions)
-    stability = [round(1 / (1 + (v+p+k)/3), 3) if (v+p+k) > 0 else 1.0
-                 for v, p, k in zip(cv_v, cv_p, cv_k)]
+    # Guard — if all ICC values are None/zero, data hasn't been computed yet
+    if all(v == 0.0 for v in icc_v + icc_p + icc_k):
+        return None
 
     fig = go.Figure()
-    fig.add_trace(go.Bar(name='CV Vata',  x=models, y=cv_v,
-                          marker_color=BLUE,    opacity=0.85))
-    fig.add_trace(go.Bar(name='CV Pitta', x=models, y=cv_p,
-                          marker_color=SAFFRON, opacity=0.85))
-    fig.add_trace(go.Bar(name='CV Kapha', x=models, y=cv_k,
-                          marker_color=TEAL,    opacity=0.85))
+    fig.add_trace(go.Bar(name='ICC Vata',  x=models, y=icc_v,
+                         marker_color=BLUE,    opacity=0.85,
+                         hovertemplate='<b>%{x}</b><br>ICC Vata: %{y:.3f}<extra></extra>'))
+    fig.add_trace(go.Bar(name='ICC Pitta', x=models, y=icc_p,
+                         marker_color=SAFFRON, opacity=0.85,
+                         hovertemplate='<b>%{x}</b><br>ICC Pitta: %{y:.3f}<extra></extra>'))
+    fig.add_trace(go.Bar(name='ICC Kapha', x=models, y=icc_k,
+                         marker_color=TEAL,    opacity=0.85,
+                         hovertemplate='<b>%{x}</b><br>ICC Kapha: %{y:.3f}<extra></extra>'))
 
-    # Stability as a line on secondary y-axis
-    fig.add_trace(go.Scatter(
-        name='Stability (1/(1+CV̄))', x=models, y=stability,
-        mode='lines+markers',
-        marker=dict(size=8, color=GOLD),
-        line=dict(color=GOLD, width=2, dash='dot'),
-        yaxis='y2',
-    ))
+    # Reference lines
+    for y_val, label, dash in [(0.75, 'Good (0.75)', 'dash'),
+                                (0.50, 'Moderate (0.50)', 'dot')]:
+        fig.add_hline(y=y_val, line=dict(color=GOLD, width=1, dash=dash),
+                      annotation_text=label,
+                      annotation_font=dict(color=GOLD, size=9),
+                      annotation_position='top right')
 
     fig.update_layout(
         **PLOTLY_TEMPLATE['layout'],
-        title='Constitutional Variance — Coefficient of Variation per Dosha<br>'
-              '<sup>High CV = scattered/Vata · Low CV = settled · '
-              'Stability score = constitutional groundedness</sup>',
+        title='Judge Reliability — ICC(2,1) per Dosha Dimension<br>'
+              '<sup>Measures cross-run consistency of judge scoring per constitutional axis · '
+              '≥0.75 good · 0.50–0.75 moderate · <0.50 poor</sup>',
         barmode='group',
         xaxis=dict(tickangle=30, tickfont=dict(size=10, color=TEXT)),
-        yaxis=dict(title='CV (σ/μ)', title_font=dict(color=MUTED),
-                   tickfont=dict(color=TEXT)),
-        yaxis2=dict(title='Stability', title_font=dict(color=GOLD),
-                    overlaying='y', side='right', range=[0, 1.1],
-                    tickfont=dict(color=GOLD)),
-        height=950,
-        margin=dict(t=80, b=60, l=60, r=60),
+        yaxis=dict(title='ICC(2,1)', range=[-0.1, 1.05],
+                   tickvals=[0, 0.25, 0.5, 0.75, 1.0],
+                   tickfont=dict(color=TEXT), gridcolor=MUTED),
+        height=650,
+        margin=dict(t=80, b=60, l=60, r=40),
     )
     return fig
 
@@ -903,14 +836,13 @@ def build_report(gvectors, dosha_vectors, probe_scores, out_dir: Path, con=None)
     """Build a single self-contained HTML report with all charts."""
 
     dosha_probe_scores = get_dosha_probe_scores(con) if con else []
-    dosha_variance     = get_dosha_variance(con) if con else []
 
     figs = {}
     figs['summary']        = make_summary_table(gvectors, probe_scores, dosha_vectors)
     figs['dosha_triangle'] = make_dosha_triangle(dosha_vectors) if dosha_vectors else None
     figs['dosha_strip']    = make_dosha_strip(dosha_probe_scores) \
                              if dosha_probe_scores else None
-    figs['cv_chart']       = make_cv_chart(dosha_variance) if dosha_variance else None
+    figs['icc_chart']      = make_icc_chart(dosha_vectors) if dosha_vectors else None
     figs['sphere']         = make_sphere_plot(gvectors)
     figs['vata_3d']        = make_3d_bar_chart(dosha_probe_scores, 'vata',  'dV',
                                 'Vata Constitutional Score by Probe & Model<br>'
@@ -927,15 +859,7 @@ def build_report(gvectors, dosha_vectors, probe_scores, out_dir: Path, con=None)
     figs['heatmap_S']      = make_heatmap(probe_scores, 'S')
     figs['heatmap_T']      = make_heatmap(probe_scores, 'T')
     figs['heatmap_R']      = make_heatmap(probe_scores, 'R')
-    figs['h2h']            = make_head_to_head(probe_scores)
     figs['divergence']     = make_divergence_chart(probe_scores)
-    figs['heatmap_S']  = make_heatmap(probe_scores, 'S')
-    figs['heatmap_T']  = make_heatmap(probe_scores, 'T')
-    figs['heatmap_R']  = make_heatmap(probe_scores, 'R')
-    figs['h2h']        = make_head_to_head(probe_scores)
-    figs['divergence'] = make_divergence_chart(probe_scores)
-
-    cat_means = None  # computed separately below
 
     # Save individual files
     for name, fig in figs.items():

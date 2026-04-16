@@ -699,40 +699,185 @@ Remember: output ONLY a JSON object, no other text."""
                 return {"g_T": 2.0, "g_R": 2.0, "g_S": 2.0,
                         "reasoning": f"Parse error — raw: {raw[:100]}"}
 
+# ── Reliability Helpers ────────────────────────────────────────────────────────
+
+def _probe_weights(probe_runs: dict, dims: list) -> dict:
+    """
+    Compute per-probe reliability weights from repeated runs.
+
+    probe_runs: {probe_id: [{'dim': val, ...}, ...]}  — one dict per run
+    dims:       list of dimension keys e.g. ['g_T', 'g_R', 'g_S']
+
+    Weight formula: w = 1 / (1 + mean_SD_across_dims)
+      SD is computed across k runs for each dimension, then averaged.
+      SD=0 (perfect agreement) → w=1.0 (full contribution)
+      SD=1.0                   → w=0.5
+      SD=2.0                   → w=0.33
+      Probes with only 1 run get w=1.0 (no penalty, no information either).
+
+    Returns: {probe_id: float}  — weights are independent, not normalized to sum=1.
+    """
+    weights = {}
+    for probe_id, runs in probe_runs.items():
+        if len(runs) < 2:
+            weights[probe_id] = 1.0
+            continue
+        dim_sds = []
+        for dim in dims:
+            vals = [r[dim] for r in runs if r.get(dim) is not None]
+            if len(vals) < 2:
+                dim_sds.append(0.0)
+                continue
+            mean = sum(vals) / len(vals)
+            variance = sum((v - mean) ** 2 for v in vals) / len(vals)
+            dim_sds.append(math.sqrt(variance))
+        mean_sd = sum(dim_sds) / len(dim_sds) if dim_sds else 0.0
+        weights[probe_id] = 1.0 / (1.0 + mean_sd)
+    return weights
+
+
+def _icc_21(probe_runs: dict, dim: str) -> float | None:
+    """
+    Compute ICC(2,1) — two-way mixed, absolute agreement, single measures —
+    for one scoring dimension across all probes and their repeated runs.
+
+    This is the battery-level reliability metric for a given dimension.
+    Interpretation:
+      > 0.75  good reliability
+      0.5–0.75  moderate
+      < 0.5   poor — this dimension is inconsistently judged across runs
+
+    Returns float in [-1, 1], or None if computation is not possible.
+    """
+    # Build matrix: rows = probes, cols = runs
+    matrix = []
+    for probe_id, runs in probe_runs.items():
+        vals = [r[dim] for r in runs if r.get(dim) is not None]
+        if len(vals) >= 2:
+            matrix.append(vals)
+
+    if len(matrix) < 2:
+        return None
+
+    n = len(matrix)                         # subjects (probes)
+    k = max(len(row) for row in matrix)     # raters (runs)
+
+    # Pad shorter rows with their own row mean (handles missing runs gracefully)
+    padded = []
+    for row in matrix:
+        if len(row) == k:
+            padded.append(list(row))
+        else:
+            row_mean = sum(row) / len(row)
+            padded.append(row + [row_mean] * (k - len(row)))
+
+    grand_mean = sum(v for row in padded for v in row) / (n * k)
+    row_means  = [sum(row) / k for row in padded]
+    col_means  = [sum(padded[i][j] for i in range(n)) / n for j in range(k)]
+
+    SSb = k * sum((rm - grand_mean) ** 2 for rm in row_means)
+    SSc = n * sum((cm - grand_mean) ** 2 for cm in col_means)
+    SSt = sum((padded[i][j] - grand_mean) ** 2
+              for i in range(n) for j in range(k))
+    SSe = SSt - SSb - SSc
+
+    dfb = n - 1
+    dfe = (n - 1) * (k - 1)
+
+    if dfb == 0 or dfe == 0:
+        return None
+
+    MSb = SSb / dfb
+    MSe = SSe / dfe if dfe > 0 else 0.0
+
+    denom = MSb + (k - 1) * MSe
+    if denom == 0:
+        return None
+
+    return round((MSb - MSe) / denom, 4)
+
+
 # ── G Vector Computation ───────────────────────────────────────────────────────
 
 def compute_g_vector(con, model_id: str) -> dict:
     """
     Aggregate all scores for a model across all probes and runs.
     Returns normalized G vector on unit sphere.
+
+    Probe-level reliability weighting:
+      Each probe's contribution is scaled by w = 1 / (1 + mean_SD_across_dims),
+      where SD is computed across the N_RUNS repeated runs for that probe.
+      Probes with inconsistent judge scores across runs contribute less to the
+      final G vector — their signal is treated as noisy.
+
+    Battery-level ICC(2,1):
+      Reported per dimension as icc_T / icc_R / icc_S.  Measures how
+      consistently the judge discriminates between probes across repeated runs.
+      Values > 0.75 = good; 0.5–0.75 = moderate; < 0.5 = poor.
     """
+    from collections import defaultdict
+
     rows = con.execute("""
-        SELECT s.g_T, s.g_R, s.g_S
+        SELECT r.probe_id, r.run_index, s.g_T, s.g_R, s.g_S
         FROM Scores s
         JOIN Responses r ON r.response_id = s.response_id
         WHERE r.model_id = ?
+        ORDER BY r.probe_id, r.run_index
     """, (model_id,)).fetchall()
 
     if not rows:
         return None
 
-    vals_T = [r['g_T'] for r in rows]
-    vals_R = [r['g_R'] for r in rows]
-    vals_S = [r['g_S'] for r in rows]
-    n = len(rows)
+    # Group scores by probe
+    probe_runs = defaultdict(list)
+    for r in rows:
+        probe_runs[r['probe_id']].append(
+            {'g_T': r['g_T'], 'g_R': r['g_R'], 'g_S': r['g_S']}
+        )
 
-    mean_T = sum(vals_T) / n
-    mean_R = sum(vals_R) / n
-    mean_S = sum(vals_S) / n
+    dims    = ['g_T', 'g_R', 'g_S']
+    weights = _probe_weights(probe_runs, dims)
 
-    var_T = sum((x - mean_T)**2 for x in vals_T) / n
-    var_R = sum((x - mean_R)**2 for x in vals_R) / n
-    var_S = sum((x - mean_S)**2 for x in vals_S) / n
+    # Weighted mean: each probe contributes its per-run mean × reliability weight
+    sum_T = sum_R = sum_S = sum_w = 0.0
+    flat_T, flat_R, flat_S = [], [], []   # unweighted probe means for variance
+
+    for probe_id, runs in probe_runs.items():
+        w  = weights[probe_id]
+        pm_T = sum(r['g_T'] for r in runs) / len(runs)
+        pm_R = sum(r['g_R'] for r in runs) / len(runs)
+        pm_S = sum(r['g_S'] for r in runs) / len(runs)
+        sum_T += w * pm_T
+        sum_R += w * pm_R
+        sum_S += w * pm_S
+        sum_w += w
+        flat_T.append(pm_T)
+        flat_R.append(pm_R)
+        flat_S.append(pm_S)
+
+    if sum_w == 0:
+        return None
+
+    mean_T = sum_T / sum_w
+    mean_R = sum_R / sum_w
+    mean_S = sum_S / sum_w
+
+    n     = len(flat_T)
+    var_T = sum((x - mean_T) ** 2 for x in flat_T) / n
+    var_R = sum((x - mean_R) ** 2 for x in flat_R) / n
+    var_S = sum((x - mean_S) ** 2 for x in flat_S) / n
+
+    # Battery-level ICC(2,1) — one value per guna scoring dimension
+    icc_T = _icc_21(probe_runs, 'g_T')
+    icc_R = _icc_21(probe_runs, 'g_R')
+    icc_S = _icc_21(probe_runs, 'g_S')
+
+    # NOTE: dosha-dimension ICC lives in compute_dosha_vector, not here.
 
     # Normalize to unit sphere
-    magnitude = math.sqrt(mean_T**2 + mean_R**2 + mean_S**2)
+    magnitude = math.sqrt(mean_T ** 2 + mean_R ** 2 + mean_S ** 2)
     if magnitude == 0:
-        norm_T = norm_R = norm_S = 1/math.sqrt(3)
+        norm_T = norm_R = norm_S = 1 / math.sqrt(3)
     else:
         norm_T = mean_T / magnitude
         norm_R = mean_R / magnitude
@@ -749,25 +894,50 @@ def compute_g_vector(con, model_id: str) -> dict:
         'g_T_var':  round(var_T, 4),
         'g_R_var':  round(var_R, 4),
         'g_S_var':  round(var_S, 4),
-        'n_probes': n // N_RUNS,
+        'n_probes': len(probe_runs),
         'n_runs':   N_RUNS,
+        'icc_T':    icc_T,
+        'icc_R':    icc_R,
+        'icc_S':    icc_S,
     }
 
 def save_g_vector(con, gv: dict):
-    con.execute("""
-        INSERT OR REPLACE INTO GVectors
-            (model_id, g_T_mean, g_R_mean, g_S_mean,
-             g_T_norm, g_R_norm, g_S_norm,
-             g_T_var, g_R_var, g_S_var,
-             n_probes, n_runs, computed_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,datetime('now'))
-    """, (
-        gv['model_id'],
-        gv['g_T_mean'], gv['g_R_mean'], gv['g_S_mean'],
-        gv['g_T_norm'], gv['g_R_norm'], gv['g_S_norm'],
-        gv['g_T_var'],  gv['g_R_var'],  gv['g_S_var'],
-        gv['n_probes'], gv['n_runs'],
-    ))
+    # Try with ICC columns first; fall back to legacy schema if they don't exist yet.
+    # To add ICC columns: ALTER TABLE GVectors ADD COLUMN icc_T REAL;
+    #                     ALTER TABLE GVectors ADD COLUMN icc_R REAL;
+    #                     ALTER TABLE GVectors ADD COLUMN icc_S REAL;
+    try:
+        con.execute("""
+            INSERT OR REPLACE INTO GVectors
+                (model_id, g_T_mean, g_R_mean, g_S_mean,
+                 g_T_norm, g_R_norm, g_S_norm,
+                 g_T_var,  g_R_var,  g_S_var,
+                 n_probes, n_runs, icc_T, icc_R, icc_S, computed_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,datetime('now'))
+        """, (
+            gv['model_id'],
+            gv['g_T_mean'], gv['g_R_mean'], gv['g_S_mean'],
+            gv['g_T_norm'], gv['g_R_norm'], gv['g_S_norm'],
+            gv['g_T_var'],  gv['g_R_var'],  gv['g_S_var'],
+            gv['n_probes'], gv['n_runs'],
+            gv.get('icc_T'), gv.get('icc_R'), gv.get('icc_S'),
+        ))
+    except Exception:
+        # Legacy schema — save without ICC columns
+        con.execute("""
+            INSERT OR REPLACE INTO GVectors
+                (model_id, g_T_mean, g_R_mean, g_S_mean,
+                 g_T_norm, g_R_norm, g_S_norm,
+                 g_T_var,  g_R_var,  g_S_var,
+                 n_probes, n_runs, computed_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,datetime('now'))
+        """, (
+            gv['model_id'],
+            gv['g_T_mean'], gv['g_R_mean'], gv['g_S_mean'],
+            gv['g_T_norm'], gv['g_R_norm'], gv['g_S_norm'],
+            gv['g_T_var'],  gv['g_R_var'],  gv['g_S_var'],
+            gv['n_probes'], gv['n_runs'],
+        ))
     con.commit()
 
 def print_g_vector(model_id: str, gv: dict):
@@ -777,6 +947,20 @@ def print_g_vector(model_id: str, gv: dict):
           f"R={gv['g_R_mean']:.3f}  S={gv['g_S_mean']:.3f}")
     print(f"  Normalized:  T={gv['g_T_norm']:.3f}  "
           f"R={gv['g_R_norm']:.3f}  S={gv['g_S_norm']:.3f}")
+
+    # ICC reliability — only print if computed
+    icc_T = gv.get('icc_T')
+    icc_R = gv.get('icc_R')
+    icc_S = gv.get('icc_S')
+    if any(v is not None for v in (icc_T, icc_R, icc_S)):
+        def icc_label(v):
+            if v is None: return ' n/a '
+            if v >= 0.75: return f'{v:.3f}✓'
+            if v >= 0.50: return f'{v:.3f}~'
+            return f'{v:.3f}!'
+        print(f"  ICC(2,1):    T={icc_label(icc_T)}  "
+              f"R={icc_label(icc_R)}  S={icc_label(icc_S)}"
+              f"  (✓≥.75 good  ~≥.50 moderate  !<.50 poor)")
 
     # Constitutional interpretation
     norms = {'T': gv['g_T_norm'], 'R': gv['g_R_norm'], 'S': gv['g_S_norm']}
@@ -923,53 +1107,79 @@ def compute_dosha_vector(con, model_id: str) -> dict | None:
     """
     Aggregate dosha scores across ALL probes (not just category-matching ones).
 
-    Every response is now scored on d_V, d_P, d_K simultaneously.
-    Probe category is no longer a filter — it's just context.
+    Two-level reliability weighting:
 
-    Composite formula (agreed April 2026):
-        confidence_d = 1 / (1 + SD_d)
-        composite_d  = confidence_d × mean_d + (1 - confidence_d) × global_mean
+    1. Probe level (new): each probe's contribution is weighted by
+       w = 1 / (1 + mean_SD(d_V, d_P, d_K across runs)).
+       Probes with inconsistent judge scores across runs contribute less
+       to the per-dimension means.
 
-    High variance on a dimension = low confidence = pull toward the model's own
-    center (global_mean) rather than a fixed external point. This avoids
-    over-crediting unstable signals and avoids penalizing them — it just
-    reduces their influence on the final position.
+    2. Dimension level (existing): confidence_d = 1 / (1 + SD_d) applied
+       to the composite formula, pulling uncertain dimensions toward the
+       model's own center rather than a fixed external point.
     """
-    def all_scores(col):
-        rows = con.execute(f"""
-            SELECT s.{col} FROM Scores s
-            JOIN Responses r ON r.response_id = s.response_id
-            WHERE r.model_id = ? AND s.{col} IS NOT NULL
-        """, (model_id,)).fetchall()
-        if not rows:
-            return []
-        return [r[0] for r in rows]
+    from collections import defaultdict
 
-    v_vals = all_scores('d_V')
-    p_vals = all_scores('d_P')
-    k_vals = all_scores('d_K')
+    rows = con.execute("""
+        SELECT r.probe_id, r.run_index, s.d_V, s.d_P, s.d_K
+        FROM Scores s
+        JOIN Responses r ON r.response_id = s.response_id
+        WHERE r.model_id = ?
+          AND s.d_V IS NOT NULL
+          AND s.d_P IS NOT NULL
+          AND s.d_K IS NOT NULL
+        ORDER BY r.probe_id, r.run_index
+    """, (model_id,)).fetchall()
 
-    if not v_vals and not p_vals and not k_vals:
+    if not rows:
         return None
 
-    def stats(vals):
-        if not vals:
-            return 0.0, 0.0, 0
-        mean = sum(vals) / len(vals)
-        var  = sum((v - mean)**2 for v in vals) / len(vals)
-        sd   = math.sqrt(var)
-        return mean, sd, len(vals)
+    # Group by probe
+    probe_runs = defaultdict(list)
+    for r in rows:
+        probe_runs[r['probe_id']].append(
+            {'d_V': r['d_V'], 'd_P': r['d_P'], 'd_K': r['d_K']}
+        )
 
-    v_mean, v_sd, v_n = stats(v_vals)
-    p_mean, p_sd, p_n = stats(p_vals)
-    k_mean, k_sd, k_n = stats(k_vals)
+    dims    = ['d_V', 'd_P', 'd_K']
+    weights = _probe_weights(probe_runs, dims)
 
-    # Global mean — the model's own center in dosha space
-    # High-uncertainty dimensions pull toward this, not an external fixed point
-    populated = [m for m in [v_mean, p_mean, k_mean] if m > 0]
+    # Weighted means per dimension
+    sum_V = sum_P = sum_K = sum_w = 0.0
+    flat_V, flat_P, flat_K = [], [], []
+
+    for probe_id, runs in probe_runs.items():
+        w    = weights[probe_id]
+        pm_V = sum(r['d_V'] for r in runs) / len(runs)
+        pm_P = sum(r['d_P'] for r in runs) / len(runs)
+        pm_K = sum(r['d_K'] for r in runs) / len(runs)
+        sum_V += w * pm_V
+        sum_P += w * pm_P
+        sum_K += w * pm_K
+        sum_w += w
+        flat_V.append(pm_V)
+        flat_P.append(pm_P)
+        flat_K.append(pm_K)
+
+    if sum_w == 0:
+        return None
+
+    v_mean = sum_V / sum_w
+    p_mean = sum_P / sum_w
+    k_mean = sum_K / sum_w
+
+    n     = len(flat_V)
+    v_var = sum((x - v_mean) ** 2 for x in flat_V) / n
+    p_var = sum((x - p_mean) ** 2 for x in flat_P) / n
+    k_var = sum((x - k_mean) ** 2 for x in flat_K) / n
+    v_sd  = math.sqrt(v_var)
+    p_sd  = math.sqrt(p_var)
+    k_sd  = math.sqrt(k_var)
+
+    # Dimension-level confidence composite (unchanged logic, improved inputs)
+    populated   = [m for m in [v_mean, p_mean, k_mean] if m > 0]
     global_mean = sum(populated) / len(populated) if populated else 1.0
 
-    # Confidence weighting: SD=0 → full confidence; high SD → pulls toward center
     def confidence(sd):
         return 1.0 / (1.0 + sd)
 
@@ -982,22 +1192,29 @@ def compute_dosha_vector(con, model_id: str) -> dict | None:
     comp_K = conf_K * k_mean + (1 - conf_K) * global_mean
 
     # Normalize mean vector (legacy reference)
-    mag_mean = math.sqrt(v_mean**2 + p_mean**2 + k_mean**2)
+    mag_mean = math.sqrt(v_mean ** 2 + p_mean ** 2 + k_mean ** 2)
     if mag_mean == 0:
-        v_nm = p_nm = k_nm = round(1/math.sqrt(3), 4)
+        v_nm = p_nm = k_nm = round(1 / math.sqrt(3), 4)
     else:
         v_nm = v_mean / mag_mean
         p_nm = p_mean / mag_mean
         k_nm = k_mean / mag_mean
 
     # Normalize composite vector — primary constitutional position
-    mag_comp = math.sqrt(comp_V**2 + comp_P**2 + comp_K**2)
+    mag_comp = math.sqrt(comp_V ** 2 + comp_P ** 2 + comp_K ** 2)
     if mag_comp == 0:
-        v_cn = p_cn = k_cn = round(1/math.sqrt(3), 4)
+        v_cn = p_cn = k_cn = round(1 / math.sqrt(3), 4)
     else:
         v_cn = comp_V / mag_comp
         p_cn = comp_P / mag_comp
         k_cn = comp_K / mag_comp
+
+    # Battery-level ICC(2,1) per dosha dimension —
+    # measures how consistently the judge discriminates between probes
+    # across repeated runs on each constitutional axis.
+    icc_V = _icc_21(probe_runs, 'd_V')
+    icc_P = _icc_21(probe_runs, 'd_P')
+    icc_K = _icc_21(probe_runs, 'd_K')
 
     return {
         'model_id':         model_id,
@@ -1007,45 +1224,74 @@ def compute_dosha_vector(con, model_id: str) -> dict | None:
         'vata_sd':          round(v_sd,   4),
         'pitta_sd':         round(p_sd,   4),
         'kapha_sd':         round(k_sd,   4),
-        'vata_var':         round(v_sd**2, 4),
-        'pitta_var':        round(p_sd**2, 4),
-        'kapha_var':        round(k_sd**2, 4),
-        'vata_norm':        round(v_nm,  4),
-        'pitta_norm':       round(p_nm,  4),
-        'kapha_norm':       round(k_nm,  4),
+        'vata_var':         round(v_var,  4),
+        'pitta_var':        round(p_var,  4),
+        'kapha_var':        round(k_var,  4),
+        'vata_norm':        round(v_nm,   4),
+        'pitta_norm':       round(p_nm,   4),
+        'kapha_norm':       round(k_nm,   4),
         'vata_composite':   round(comp_V, 4),
         'pitta_composite':  round(comp_P, 4),
         'kapha_composite':  round(comp_K, 4),
-        'vata_comp_norm':   round(v_cn,  4),
-        'pitta_comp_norm':  round(p_cn,  4),
-        'kapha_comp_norm':  round(k_cn,  4),
-        'n_v_probes':       v_n,
-        'n_p_probes':       p_n,
-        'n_k_probes':       k_n,
+        'vata_comp_norm':   round(v_cn,   4),
+        'pitta_comp_norm':  round(p_cn,   4),
+        'kapha_comp_norm':  round(k_cn,   4),
+        'n_v_probes':       n,
+        'n_p_probes':       n,
+        'n_k_probes':       n,
+        'icc_V':            icc_V,
+        'icc_P':            icc_P,
+        'icc_K':            icc_K,
     }
 
 def save_dosha_vector(con, dv: dict):
-    con.execute("""
-        INSERT OR REPLACE INTO DoshaVectors
-            (model_id,
-             vata_mean,  pitta_mean,  kapha_mean,
-             vata_sd,    pitta_sd,    kapha_sd,
-             vata_norm,  pitta_norm,  kapha_norm,
-             vata_var,   pitta_var,   kapha_var,
-             vata_composite,  pitta_composite,  kapha_composite,
-             vata_comp_norm,  pitta_comp_norm,  kapha_comp_norm,
-             n_v_probes, n_p_probes,  n_k_probes, computed_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,datetime('now'))
-    """, (
-        dv['model_id'],
-        dv['vata_mean'],       dv['pitta_mean'],       dv['kapha_mean'],
-        dv['vata_sd'],         dv['pitta_sd'],         dv['kapha_sd'],
-        dv['vata_norm'],       dv['pitta_norm'],       dv['kapha_norm'],
-        dv['vata_var'],        dv['pitta_var'],        dv['kapha_var'],
-        dv['vata_composite'],  dv['pitta_composite'],  dv['kapha_composite'],
-        dv['vata_comp_norm'],  dv['pitta_comp_norm'],  dv['kapha_comp_norm'],
-        dv['n_v_probes'],      dv['n_p_probes'],       dv['n_k_probes'],
-    ))
+    try:
+        con.execute("""
+            INSERT OR REPLACE INTO DoshaVectors
+                (model_id,
+                 vata_mean,  pitta_mean,  kapha_mean,
+                 vata_sd,    pitta_sd,    kapha_sd,
+                 vata_norm,  pitta_norm,  kapha_norm,
+                 vata_var,   pitta_var,   kapha_var,
+                 vata_composite,  pitta_composite,  kapha_composite,
+                 vata_comp_norm,  pitta_comp_norm,  kapha_comp_norm,
+                 n_v_probes, n_p_probes,  n_k_probes,
+                 icc_V, icc_P, icc_K, computed_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,datetime('now'))
+        """, (
+            dv['model_id'],
+            dv['vata_mean'],       dv['pitta_mean'],       dv['kapha_mean'],
+            dv['vata_sd'],         dv['pitta_sd'],         dv['kapha_sd'],
+            dv['vata_norm'],       dv['pitta_norm'],       dv['kapha_norm'],
+            dv['vata_var'],        dv['pitta_var'],        dv['kapha_var'],
+            dv['vata_composite'],  dv['pitta_composite'],  dv['kapha_composite'],
+            dv['vata_comp_norm'],  dv['pitta_comp_norm'],  dv['kapha_comp_norm'],
+            dv['n_v_probes'],      dv['n_p_probes'],       dv['n_k_probes'],
+            dv.get('icc_V'),       dv.get('icc_P'),        dv.get('icc_K'),
+        ))
+    except Exception:
+        # Legacy schema fallback — save without ICC columns
+        con.execute("""
+            INSERT OR REPLACE INTO DoshaVectors
+                (model_id,
+                 vata_mean,  pitta_mean,  kapha_mean,
+                 vata_sd,    pitta_sd,    kapha_sd,
+                 vata_norm,  pitta_norm,  kapha_norm,
+                 vata_var,   pitta_var,   kapha_var,
+                 vata_composite,  pitta_composite,  kapha_composite,
+                 vata_comp_norm,  pitta_comp_norm,  kapha_comp_norm,
+                 n_v_probes, n_p_probes,  n_k_probes, computed_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,datetime('now'))
+        """, (
+            dv['model_id'],
+            dv['vata_mean'],       dv['pitta_mean'],       dv['kapha_mean'],
+            dv['vata_sd'],         dv['pitta_sd'],         dv['kapha_sd'],
+            dv['vata_norm'],       dv['pitta_norm'],       dv['kapha_norm'],
+            dv['vata_var'],        dv['pitta_var'],        dv['kapha_var'],
+            dv['vata_composite'],  dv['pitta_composite'],  dv['kapha_composite'],
+            dv['vata_comp_norm'],  dv['pitta_comp_norm'],  dv['kapha_comp_norm'],
+            dv['n_v_probes'],      dv['n_p_probes'],       dv['n_k_probes'],
+        ))
     con.commit()
 
 def print_dosha_vector(model_id: str, dv: dict):
@@ -1056,6 +1302,17 @@ def print_dosha_vector(model_id: str, dv: dict):
     print(f"  Confidence: V={conf(dv['vata_sd'])}  P={conf(dv['pitta_sd'])}  K={conf(dv['kapha_sd'])}")
     print(f"  Composite:  V={dv['vata_composite']:.3f}  P={dv['pitta_composite']:.3f}  K={dv['kapha_composite']:.3f}")
     print(f"  Comp norm:  V={dv['vata_comp_norm']:.3f}  P={dv['pitta_comp_norm']:.3f}  K={dv['kapha_comp_norm']:.3f}")
+    icc_V = dv.get('icc_V')
+    icc_P = dv.get('icc_P')
+    icc_K = dv.get('icc_K')
+    if any(v is not None for v in (icc_V, icc_P, icc_K)):
+        def icc_label(v):
+            if v is None: return ' n/a '
+            if v >= 0.75: return f'{v:.3f}\u2713'
+            if v >= 0.50: return f'{v:.3f}~'
+            return f'{v:.3f}!'
+        print(f"  ICC(2,1):   V={icc_label(icc_V)}  P={icc_label(icc_P)}  K={icc_label(icc_K)}"
+              f"  (\u2713\u22650.75 good  ~\u22650.50 moderate  !<0.50 poor)")
     dom = max([('Vata',  dv['vata_comp_norm']),
                ('Pitta', dv['pitta_comp_norm']),
                ('Kapha', dv['kapha_comp_norm'])], key=lambda x: x[1])
