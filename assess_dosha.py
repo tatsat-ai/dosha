@@ -364,7 +364,7 @@ class GoogleAdapter(BaseAdapter):
         config = types.GenerateContentConfig(
             temperature=temperature,
             max_output_tokens=MAX_TOKENS,
-            thinking_config=types.ThinkingConfig(thinking_level='low'),
+            # thinking_config=types.ThinkingConfig(thinking_level='low'),
         )
         for attempt in range(MAX_RETRIES):
             try:
