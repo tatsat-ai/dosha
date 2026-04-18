@@ -423,6 +423,11 @@ def get_adapter(model_row) -> BaseAdapter:
         return AnthropicAdapter()
     elif api_type == 'ollama':
         return OllamaAdapter()
+    elif api_type == 'llama':
+        return OpenAICompatAdapter(
+                                   env_key='LLAMACPP_API_KEY',
+                                   base_url='http://fritz.local:8080/v1'
+    )
     elif api_type == 'openai_compat':
         return OpenAICompatAdapter('OPENAI_API_KEY')
     elif api_type == 'mistral':
